@@ -66,6 +66,7 @@ NAME_MAP = {
     "Hong Kong, China": "Hong Kong", "Hong Kong (China)": "Hong Kong",
     "China (People's Republic of)": "China", "US": "United States",
     "United States of America": "United States", "UK": "United Kingdom",
+    "U.S.": "United States", "USA": "United States", "Euro Area": "Euro Area",
 }
 
 
@@ -189,29 +190,47 @@ def fetch_yields():
     meta = {"source": TE_URL, "fetched": datetime.now().strftime("%Y-%m-%d %H:%M")}
     try:
         r = get(TE_URL)
+        if "<table" not in r.text.lower():
+            raise ValueError("page returned no tables (likely bot-blocked)")
         tables = pd.read_html(io.StringIO(r.text))
         yields, dates = {}, []
         for t in tables:
-            cols = [str(c) for c in t.columns]
-            ycol = next((c for c in cols if c.lower().startswith("yield")), None)
+            t = t.copy()
+            t.columns = [" ".join(map(str, c)) if isinstance(c, tuple) else str(c) for c in t.columns]
+            cols = list(t.columns)
+            ycol = next((c for c in cols if "yield" in c.lower()), None)
             if ycol is None:
                 continue
-            ccol = cols[0] if cols[0] != ycol else cols[1]
-            dcol = next((c for c in cols if c.lower() == "date"), None)
+            dcol = next((c for c in cols if c.lower().strip() == "date"), None)
+            # country/instrument column = first text column that isn't the yield column
+            ccol = next((c for c in cols if c != ycol and t[c].astype(str).str.contains(r"[A-Za-z]{2}").mean() > 0.5),
+                        None)
+            if ccol is None:
+                continue
             for _, row in t.iterrows():
                 v = to_pct_number(row[ycol])
-                if v is None:
+                if v is None or not (-2 <= v <= 60):
                     continue
-                yields[norm_country(row[ccol])] = v / 100
+                name = str(row[ccol]).strip()
+                tenor = re.search(r"\b(\d+)\s*[YM]\b", name)
+                if tenor and tenor.group(0).replace(" ", "").upper() != "10Y":
+                    continue  # skip 2Y, 30Y, 3M etc.
+                name = re.sub(r"\b\d+\s*[YM]\b", "", name).strip()
+                key = norm_country(name)
+                # prefer an explicit 10Y quote over a tenor-less one
+                if key not in yields or tenor:
+                    yields[key] = v / 100
                 if dcol:
                     dates.append(str(row[dcol]))
         if "United States" not in yields:
-            raise ValueError("US yield not found")
+            sample = ", ".join(list(yields)[:6]) or "none"
+            raise ValueError(f"US 10Y not found; parsed names e.g. {sample}")
         meta["status"] = "live"
         meta["data_date"] = f"latest quote ({max(dates) if dates else 'intraday'})"
         return yields, meta
     except Exception as e:  # noqa: BLE001
-        meta.update(status=f"FAILED ({e.__class__.__name__}) – enter yields manually", data_date="n/a")
+        meta.update(status=f"FAILED ({e.__class__.__name__}: {str(e)[:120]}) – enter yields manually",
+                    data_date="n/a")
         return {"United States": 0.0425}, meta
 
 
